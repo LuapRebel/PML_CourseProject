@@ -1,0 +1,203 @@
+---
+output: html_document
+---
+---
+title: "Practical Machine Learning - Course Project"
+date: \today
+---   
+
+```{r options, warning=FALSE, message=FALSE}
+library(knitr)
+opts_chunk$set(fig.align='center', warning=FALSE, message=FALSE)
+library(RCurl)
+library(caret)
+library(randomForest)
+library(gbm); library(plyr)
+library(ipred)
+library(MASS)
+library(klaR)
+options(digits=3)
+```
+
+## Synopsis   
+
+The benefits that exercise confers on human health have been studied in great detail.  What has not been analyzed to a such a great extent is whether people exercising are in fact doing these exercises properly.  In fact, a definition of "how well" an individual is exercising has not been created in the popular lexicon. 
+
+In the study [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201), the researchers attempted to both define "how well" exercise was being done, as well as track the specific physical movements used in that definition.  There are a number of devices available (e.g. Jawbone Up, Nike FuelBand, and Fitbit) that can be utilized to gather very specific data about an individual's workout.  The researchers developed a five tier definition (A, B, C, D, E) defining "how well" an individual was performing a Unilateral Dumbbell Biceps Curl, using the Microsoft Kinect Sensor to track the subject's movements. Class A is considered to be the proper way to perform the exercise and Classes B-E are variations considered to be improper. 
+
+The goal of this project is to develop a model to predict the "classe" of exercise (A, B, C, D, E) from a small test set pulled from the larger study set.
+
+### Description of the Data   
+
+The training data for this project are available here: 
+
+[Training Set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+
+The test data are available here: 
+
+[Test Set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har.
+
+The variables tracked correspond to four different aspects of study:  
+1. Roll, pitch, and yaw (Euler angles of movement)  
+2. Accelerometer, gyroscope, and magnetometer readings  
+3. Statistical summaries of the items of the Euler angles (mean, variance, standard deviation, max, min, amplitude, kurtosis, and skewness)   
+4. Sensors placed on the belt, arm, forearm, and dumbbell.
+
+### Downloading and Loading the Dataset   
+The data contains many empty fields as well as fields containing "#DIV/0!" where the original spreadsheet produced an error.  When loading the data, we will replace these fields with an "NA" field so that we can better analyze the data in R.  
+
+```{r loaddata, cache=TRUE}
+## Check to see if raw data files exist and download if not
+if(!file.exists("./pml-training.csv")){
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  destfile="pml-training.csv", method="curl")
+}
+if(!file.exists("./pml-testing.csv")){
+    download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                  destfile="pml-testing.csv", method="curl")
+}
+
+## Load WLED data, replacing blank and "#DIV/0!" fields with NAs
+wled <- read.csv("./pml-training.csv", na.strings=c("", "NA", "#DIV/0!"))
+```
+### Exploring the Data
+The overall dimensions of the data set are:
+
+```{r dimdata}
+dim(wled)
+```
+
+The variable we are most interested in is 'classe':
+```{r classe}
+summary(wled$classe)
+```  
+
+As is stated above, there are many NA values in this set.  The overall percentage of NA values is:  
+```{r nas}
+(sum(is.na(wled)) / (dim(wled)[1] * dim(wled)[2])) * 100
+```
+
+### Preprocessing the Data   
+
+It was necessary to remove columns with a high percentage of NA values, as these variables cannot be counted on to be accurate predictors.  As you can see below, all columns fell into two groups, those with no NA values, and those with a very high percentage (> 97%) of NA values:
+
+```{r removeNAs}
+# Remove columns with too many NAs
+naCols <- numeric() 
+for (i in 1:ncol(wled)){
+     naCols[i] <- sum(is.na(wled[,i]))}
+nas <- data.frame(table(round(naCols/19622, 3) * 100))
+names(nas) <- c("Percent NAs", "# of Columns")
+nas
+```  
+
+Since the variables with NA values have such a large proportion of their values being NA, imputation was not considered to be a viable option.  The dataset was then truncated to include only the variables where the percentage of NA values was zero.  This decreased the number of variables from 160 to 60.
+
+```{r trun1}
+wled <- wled[, naCols == 0]
+```
+
+The first 8 variables in the dataset are not variables on which we would want to base our prediction, as they have no relationship to the physical movements being tracked.  They were removed from the dataset, leaving 51 variables.
+
+```{r trun2}
+wled <- wled[, 9:60]
+```
+
+To check for variables that may be all the same value, the nearZeroVar function was performed on the dataset.  No 'zero covariates' were discovered.
+```{r nzv}
+nzv <- nearZeroVar(wled, saveMetrics=TRUE)
+which(nzv$zeroVar == TRUE)
+```  
+
+The next step was to subset our dataset into 'training' and 'testing' sets to perform cross-validation.  The training set consisted of 75% of the observations, and the testing set 25%.  
+
+```{r splitdata}
+## Split data into training and testing datasets
+inTrain <- createDataPartition(y=wled$classe, p=0.75, list=FALSE)
+training <- wled[inTrain,]
+testing <- wled[-inTrain,]
+```
+Dimensions of training set:     **`r dim(training)`**  
+Dimensions of testing set:      **`r dim(testing)`**  
+
+## Model Selection  
+####Linear Regression   
+Neither type of linear model, Linear Regression or Generalized Linear Models, will be of use in this particular problem.  Linear Regression will not give us results corresponding to our alphabetical values of our dependent variable.  Generalized Linear Models are not useful in cases where the dependent variable has greater than two categories.
+
+###Classification Models
+Five types of classification models were run on the data, Random Forest, Bagged CART, Gradient Boosting, Quadratic Discriminant Analysis, and Naive Bayes.  A 5-fold cross validation resampling procedure was set for all models.  For each model, a Confusion Matrix was performed, comparing the actual results of 'classe' from the testing set to the result for 'classe' achieved by predicting on the testing set.   
+
+####Random Forest Model  
+```{r rfmodel, cache=TRUE}
+set.seed(12321)
+trCtrl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+modelrf <- train(classe ~ ., data=training, method="rf", trControl=trCtrl, prox=FALSE)
+confusionMatrix(testing$classe, predict(modelrf, testing))
+```  
+
+####Bagged CART Model
+```{r bagmodel, cache=TRUE}
+## Create Bagged CART Model
+set.seed(12321)
+modelbag <- train(classe ~ ., data=training, method="treebag", trControl=trCtrl)
+confusionMatrix(testing$classe, predict(modelbag, testing))
+```
+
+####Gradient Boosting Model
+```{r boostmodel, cache=TRUE}
+## Create Gradient Boosting Model
+set.seed(12321)
+modelgbm <- train(classe ~ ., data=training, method="gbm", trControl=trCtrl, 
+                  verbose=FALSE)
+confusionMatrix(testing$classe, predict(modelgbm, testing))
+```
+
+####Quadratic Discriminant Analysis Model
+```{r qdamodel, cache=TRUE}
+set.seed(12321)
+modelqda <- train(classe ~ ., data=training, method="qda", trControl=trCtrl)
+confusionMatrix(testing$classe, predict(modelqda, testing))
+```
+
+####Naive Bayes Model
+```{r nbmodel, cache=TRUE}
+set.seed(12321)
+modelnb <- train(classe ~ ., data=training, method="nb", trControl=trCtrl)
+confusionMatrix(testing$classe, predict(modelnb, testing))
+```
+
+###Comparison of Models Used in Analysis  
+The Random Forest and Bagged CART models were the most accurate, with out of sample error rates close to 1%.  Gradient Boosting achieved an out of sample error rate of 4%.  The Quadratic Discriminant Analysis and Naive Bayes were less accurate, with out of sample error rates of around 12 % and 26% respectively.  Plots of the most important variables in the three most successful models are show below.  
+```{r compare}
+compare <- list("Random Forest"=modelrf$results[2, 2:5], 
+                "Bagged CART"=modelbag$results[, 2:5], 
+                "Gradient Boosting"=modelgbm$results[9, 4:7], 
+                "Quadratic Discriminant Analysis"=modelqda$results[, 2:5], 
+                "Naive Bayes"=modelnb$results[2, 3:6])
+compare <- do.call(rbind.data.frame, compare)
+compare$OutOfSampleError <- 1 - c(0.994, 0.989, 0.96, 0.883, 0.738)
+kable(compare)
+```
+
+```{r plots, fig.height=6, fig.width=9, cache=TRUE}
+plot(varImp(modelrf))
+plot(varImp(modelbag))
+plot(varImp(modelgbm))
+``` 
+
+###Results of Models Applied to Submission Set   
+In regards to the submisson set for the assignment, the Random Forest, Bagged CART, and Gradient Boosting Models all gave the same results.  The Quadratic Discriminant Analysis Model gave the same results as these, except for the first observation.  The Naive Bayes Model gave the same results in only 65% of the cases (13/20).
+
+```{r results}
+submission <- read.csv("pml-testing.csv")
+results <- t(data.frame(randomForest = predict(modelrf, submission), 
+                      bag = predict(modelbag, submission),
+                      boost = predict(modelgbm, submission),
+                      qda = predict(modelqda, submission),
+                      naiveBayes = predict(modelnb, submission)))
+results
+```
+
+
